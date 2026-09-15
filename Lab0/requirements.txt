@@ -1,0 +1,12 @@
+torchprofile
+onnx
+onnxscript
+onnxruntime
+numpy
+tqdm
+jupyterlab
+notebook
+ipykernel
+transformers
+accelerate
+huggingface_hub[cli]

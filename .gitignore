@@ -1,0 +1,21 @@
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+
+# Local environments
+.conda/
+.venv/
+env/
+venv/
+
+# Data / temporary files
+data/
+
+# Large generated model files
+*.pt
+*.onnx
+*.onnx.data
+
+# OS files
+.DS_Store
+Thumbs.db
