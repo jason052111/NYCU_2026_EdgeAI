@@ -19,3 +19,21 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Lab1 generated files
+/Lab1/sgemm
+/Lab1/ptxas_info.txt
+/Lab1/reports/
+/Lab1/submit/
+
+# Lab1 LaTeX temporary files
+/Lab1/*.aux
+/Lab1/*.log
+/Lab1/*.out
+/Lab1/*.toc
+/Lab1/*.lof
+/Lab1/*.lot
+/Lab1/*.fls
+/Lab1/*.fdb_latexmk
+/Lab1/*.synctex.gz
+/Lab1/*.xdv

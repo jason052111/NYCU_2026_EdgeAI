@@ -1,0 +1,1083 @@
+% !TeX program = xelatex
+% Overleaf: Settings > Compiler > XeLaTeX.
+% Missing screenshots render placeholders; add the real images before submission.
+\documentclass[UTF8,fontset=none,11pt,a4paper]{ctexart}
+
+% Use Traditional Chinese fonts on Overleaf, with a Windows preview fallback.
+\IfFontExistsTF{Noto Serif CJK TC}{
+  \setCJKmainfont{Noto Serif CJK TC}
+  \setCJKsansfont{Noto Sans CJK TC}
+  \setCJKmonofont{Noto Sans Mono CJK TC}
+}{
+  \setCJKmainfont[AutoFakeBold=2]{MingLiU}
+  \setCJKsansfont{Microsoft JhengHei}
+  \setCJKmonofont{MingLiU}
+}
+
+\usepackage[margin=23mm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[labelformat=empty]{caption}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdftitle={Lab 1: SGEMM Optimization},
+  pdfauthor={314551147}
+}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlength{\emergencystretch}{2em}
+\renewcommand{\arraystretch}{1.15}
+\ctexset{
+  section={format=\Large\bfseries},
+  subsection={format=\large\bfseries}
+}
+
+% TODO: Replace only the name below. The student ID is already filled in.
+\newcommand{\studentname}{楊承恩}
+\newcommand{\studentid}{314551147}
+
+% Optional graphic options can trim display margins without changing the image.
+\newcommand{\reportscreenshot}[4][]{%
+  \begin{figure}[H]
+    \centering
+    \IfFileExists{#2}{%
+      \includegraphics[#1,width=\linewidth,height=0.38\textheight,keepaspectratio]{#2}%
+    }{%
+      \fbox{\begin{minipage}[c][18mm][c]{0.92\linewidth}
+        \centering
+        待補實測截圖（目前尚未加入）\\[0.4em]
+        {\small\texttt{\detokenize{#2}}}
+      \end{minipage}}%
+    }
+    \caption{#3}
+    \label{#4}
+  \end{figure}
+}
+
+\title{\textbf{Lab 1: SGEMM Optimization}\\[0.3em]
+       \large Edge AI 實驗報告}
+\author{姓名：\studentname\qquad 學號：\studentid}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Part 0: Know Your GPU}
+
+\subsection*{Q1. GPU 規格與理論峰值}
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+項目 & 數值 \\
+\midrule
+GPU 名稱 & NVIDIA Tesla T4 \\
+Compute capability & 7.5 \\
+SM 數量 & 40 \\
+CUDA cores 數量 & 2560 \\
+最高 Boost clock & $1590\ \mathrm{MHz}=1.59\ \mathrm{GHz}$ \\
+記憶體資料傳輸速率 & 約 $10\ \mathrm{Gbps/pin}$ \\
+記憶體匯流排寬度 & $256\ \mathrm{bits}$ \\
+FP32 理論峰值 & $8140.8\ \mathrm{GFLOP/s}$（約 $8.14\ \mathrm{TFLOP/s}$）\\
+DRAM 理論頻寬 & $320\ \mathrm{GB/s}$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+T4 的官方規格列出 2560 個 CUDA cores 與約 $8.1\ \mathrm{TFLOP/s}$
+的 FP32 效能。T4 採用 Turing 架構，compute capability 為 7.5；每個 SM 含 64 個
+FP32 cores，因此 $40\times64=2560$，與 CUDA cores 總數一致。
+
+\textbf{FP32 理論峰值。}
+一次融合乘加（fused multiply-add, FMA）包含一次乘法與一次加法，
+計為兩次浮點運算。依作業指定的公式，以最高 Boost clock 計算：
+\begin{align*}
+P_{\mathrm{peak}}
+  &=2\times N_{\mathrm{cores}}\times f_{\mathrm{boost}}\\
+  &=2\times2560\times1.59\\
+  &=8140.8\ \mathrm{GFLOP/s}.
+\end{align*}
+其中時脈使用 GHz，因此結果為 GFLOP/s。此結果與官方約
+$8.1\ \mathrm{TFLOP/s}$ 的規格相符；它是理論上限，並非 kernel 的實測效能。
+
+\textbf{DRAM 理論頻寬。}
+以每條資料線的傳輸速率乘上匯流排寬度，再以每 byte 等於 8 bits 轉換：
+\begin{align*}
+B_{\mathrm{peak}}
+  &=\frac{\text{data rate}\times\text{bus width}}{8}\\
+  &=\frac{10\times256}{8}\\
+  &=320\ \mathrm{GB/s}.
+\end{align*}
+此結果與官方 Product Brief 的最高 $320\ \mathrm{GB/s}$ 相符。
+這裡的頻寬是 GPU 與其顯示記憶體之間的頻寬，不是主機與 GPU 之間的
+PCIe 傳輸頻寬。
+
+\subsection*{Q2. Ridge point 與 SGEMM 運算強度}
+
+\textbf{Ridge point。}
+Roofline 模型以計算峰值及記憶體頻寬界定效能上限。
+兩條上限相交時的運算強度為：
+\begin{align*}
+I_{\mathrm{ridge}}
+  &=\frac{P_{\mathrm{peak}}}{B_{\mathrm{peak}}}\\
+  &=\frac{8140.8\ \mathrm{GFLOP/s}}{320\ \mathrm{GB/s}}\\
+  &=25.44\ \mathrm{FLOP/byte}.
+\end{align*}
+
+\textbf{SGEMM 的運算量。}
+令 $M=N=K=4096$。按照作業的計數方式，每個 C 元素需執行 $K$ 次乘加，
+每次乘加計為 2 FLOP，因此主要矩陣乘法的運算量為：
+\begin{align*}
+F&=2MNK\\
+ &=2\times4096^3\\
+ &=137{,}438{,}953{,}472\ \mathrm{FLOP}.
+\end{align*}
+
+\textbf{DRAM 資料傳輸量。}
+依題目假設，A 與 B 各從 DRAM 讀取一次，C 寫回一次。
+每個 FP32 元素占 4 bytes；此模型不另外計入讀取舊 C 的流量。
+\begin{align*}
+D&=4(MK+KN+MN)\\
+ &=4\times3\times4096^2\\
+ &=201{,}326{,}592\ \mathrm{bytes}
+  =192\ \mathrm{MiB}.
+\end{align*}
+
+\textbf{Arithmetic intensity。}
+運算強度是運算量與 DRAM 資料傳輸量之比：
+\begin{align*}
+I_{\mathrm{SGEMM}}
+  &=\frac{F}{D}
+   =\frac{2MNK}{4(MK+KN+MN)}\\
+  &=\frac{2\times4096^3}{4\times3\times4096^2}
+   =\frac{4096}{6}\\
+  &\approx682.67\ \mathrm{FLOP/byte}.
+\end{align*}
+
+\textbf{瓶頸判斷。}
+由於
+\[
+I_{\mathrm{SGEMM}}\approx682.67
+>I_{\mathrm{ridge}}=25.44\ \mathrm{FLOP/byte},
+\]
+此大小的 SGEMM 在題目指定的理想資料讀寫假設下屬於
+\textbf{compute-bound}。每搬動一份資料所需執行的運算量很高，
+因此理論上先受到 FP32 計算能力上限限制，而非 DRAM 頻寬上限。
+
+此結論不代表 naive kernel 實測時一定為 compute-bound。
+若資料未有效重複使用、產生額外 DRAM 流量，或存在其他執行限制，
+實際瓶頸仍需透過後續 profiler 指標判斷。
+
+\clearpage
+\section*{Part 1: The Naive Kernel and the Profiler}
+
+\subsection*{Q1. Benchmark 結果}
+
+在 $M=N=K\in\{1024,2048,4096\}$、$\alpha=1$、$\beta=0$ 下，
+naive 與 cuBLAS 的結果皆為 \texttt{PASS}。
+Naive 的效能約為 $61\ \mathrm{GFLOP/s}$，明顯低於 cuBLAS，
+且僅達 GPU FP32 理論峰值的 $0.7\%$--$0.8\%$。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}rlrrrrc@{}}
+\toprule
+$M=N=K$ & Kernel & ms & GFLOP/s & \%cuBLAS & \%peakF & Check \\
+\midrule
+1024 & naive  & 35.4488   & 60.6   & 1.6   & 0.7  & PASS \\
+1024 & cuBLAS & 0.7373    & 2912.7 & 100.0 & 35.8 & PASS \\
+2048 & naive  & 278.6551  & 61.7   & 1.5   & 0.8  & PASS \\
+2048 & cuBLAS & 6.0286    & 2849.7 & 100.0 & 35.0 & PASS \\
+4096 & naive  & 2232.1255 & 61.6   & 1.5   & 0.8  & PASS \\
+4096 & cuBLAS & 34.4986   & 3983.9 & 100.0 & 48.9 & PASS \\
+\bottomrule
+\end{tabular}
+\caption{Naive 與 cuBLAS 的 benchmark 結果。}
+\label{tab:part1-benchmark}
+\end{table}
+
+Naive 在三種尺寸下約為 $60.6$--$61.7\ \mathrm{GFLOP/s}$；尺寸加倍時，
+運算量與執行時間都約增加八倍。以相同尺寸的量測時間相除，
+cuBLAS 分別約快 $48.08\times$、$46.22\times$ 與 $64.70\times$。
+\texttt{\%cuBLAS} 以各筆 benchmark 對應的 cuBLAS 參考時間為基準，
+因此不一定與兩筆獨立量測的時間比值完全相同。
+
+\reportscreenshot{graph/1024.png}
+  {$1024^3$ 的 naive 與 cuBLAS benchmark 原始輸出。}
+  {fig:part1-benchmark-1024}
+\reportscreenshot{graph/2048.png}
+  {$2048^3$ 的 naive 與 cuBLAS benchmark 原始輸出。}
+  {fig:part1-benchmark-2048}
+\reportscreenshot{graph/4096.png}
+  {$4096^3$ 的 naive 與 cuBLAS benchmark 原始輸出。}
+  {fig:part1-benchmark-4096}
+
+\clearpage
+\subsection*{Q2. Profiler 指標、瓶頸與 FP32 峰值比例}
+
+以下分析 $2048^3$ 的 naive kernel，從記憶體階層吞吐、
+sector 存取效率與 warp stall 判斷主要瓶頸。
+
+\textbf{GPU Speed Of Light 與記憶體階層。}
+Memory Throughput 為 $49.77\%$，
+比 Compute (SM) Throughput 的 $6.03\%$ 更接近 $100\%$。
+這支持先檢查記憶體存取效率，而不是認為 FP32 計算管線已飽和。
+不過，這裡的 Memory Throughput 是整體記憶體處理的指標，
+\emph{不能當成 DRAM 頻寬使用率}。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+GPU Speed Of Light 指標 & 實測值 \\
+\midrule
+Duration & $278.23\ \mathrm{ms}$ \\
+Compute (SM) Throughput & $6.03\%$ \\
+Memory Throughput & $49.77\%$ \\
+L1/TEX Cache Throughput & $99.53\%$ \\
+L2 Cache Throughput & $0.70\%$ \\
+DRAM Throughput & $2.49\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Naive 在 $2048^3$ 的 GPU Speed Of Light 指標。}
+\label{tab:part1-sol}
+\end{table}
+
+\reportscreenshot{graph/sol.png}
+  {GPU Speed Of Light Throughput 的實測指標。}
+  {fig:part1-sol}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+Memory Workload Analysis 指標 & 實測值 \\
+\midrule
+Memory Throughput（DRAM 讀寫合計）& $8.00\ \mathrm{GB/s}$ \\
+L1/TEX Hit Rate & $99.04\%$ \\
+L2 Hit Rate & $82.07\%$ \\
+\bottomrule
+\end{tabular}
+\caption{實際 DRAM 吞吐與 cache 命中率。}
+\label{tab:part1-memory}
+\end{table}
+
+L1/TEX 的吞吐指標很高，但 L2 與 DRAM 的吞吐很低；實際 DRAM 讀寫合計
+僅 $8.00\ \mathrm{GB/s}$，約為 $320\ \mathrm{GB/s}$ 理論頻寬的 $2.5\%$。
+不同硬體指標的 active/elapsed 正規化基準不完全相同，不能直接相加，
+或將它們解讀成資料流量的分配比例。
+
+L1 的 sector 命中率為 $99.04\%$，表示大多數被查詢的 sector 已在 L1，
+不必每次都從 DRAM 重新取得；L2 命中率則針對到達 L2 的查詢，
+與 L1 命中率的分母不同。高命中率不代表每個請求的處理成本低，
+因此還需要檢查 sector 數與 warp stall。
+
+\reportscreenshot{graph/memory.png}
+  {Memory Workload Analysis 的 DRAM 吞吐與 L1/L2 命中率。}
+  {fig:part1-memory}
+
+\textbf{Global-load sectors per request。}
+L1/TEX 的 global-load sectors/request 為 $16.50$，
+global-store sectors/request 為 $32.00$。一個 sector 為 32 bytes，
+因此對 32 個 thread 各存取一個連續且對齊的 FP32 元素而言，只需 4 個 sector。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+存取類型 & Requests & Sectors & Sectors/Request \\
+\midrule
+Global Load & $537{,}001{,}984$ & $8{,}862{,}535{,}049$ & $16.50$ \\
+Global Store & $131{,}072$ & $4{,}194{,}304$ & $32.00$ \\
+\bottomrule
+\end{tabular}
+\caption{L1/TEX 的 global load/store 存取統計。比例以 sectors 除以 requests。}
+\label{tab:part1-sectors}
+\end{table}
+
+Naive 的 \texttt{threadIdx.x} 對應 row；block 為 $(32,32)$，
+所以同一個 warp 的 32 個 thread 負責不同 row、相同 col。
+在固定的 $k$ 下，\texttt{A[row*K+k]} 在相鄰 thread 間相隔
+$2048\times4=8192$ bytes，涉及 32 個不同 sector；
+\texttt{B[k*N+col]} 則是所有 thread 讀同一個元素，只涉及 1 個 sector。
+主要迴圈兩種讀取的平均為 $(32+1)/2=16.5$，與實測 $16.50$ 相符。
+整份統計還包含迴圈外的讀取，因此實測比例不必恰好等於 $16.5$。
+C 的寫回同樣跨不同列，與實測每個 store request 涉及 32 個 sector 一致。
+
+這是\emph{同時存取的地址分散}，不是矩陣本身未連續儲存。
+此外，L1 的 sector 存取數不能直接當成 DRAM 搬運量：
+例如同一 thread 在相鄰 $k$ 迴圈讀取的 A 元素是連續的，
+只要 sector 尚未被替換，就能在後續迴圈重用 cache 中的資料。
+
+\reportscreenshot{graph/global.png}
+  {L1/TEX global load/store 的 requests、sectors 與存取效率分析。}
+  {fig:part1-global-access}
+
+\textbf{主要 warp stall。}
+LG Throttle 為 $365.25$，遠高於其他等待原因。
+依 Warp State Statistics 的定義，下列值是每個 issued instruction
+對應的平均 warp cycles，不是指令總數。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+指標 & 平均週期／issued instruction \\
+\midrule
+Warp Cycles Per Issued Instruction & $373.61$ \\
+Stall LG Throttle & $365.25$ \\
+Stall Long Scoreboard & $3.41$ \\
+Stall Not Selected & $2.47$ \\
+\bottomrule
+\end{tabular}
+\caption{Warp State Statistics 的主要等待指標。}
+\label{tab:part1-stalls}
+\end{table}
+
+LG Throttle 表示 local/global 記憶體指令的 L1 佇列已滿，
+warp 必須等候佇列有空位才能發出下一個相關指令。
+它占平均指令間隔的比例為
+\[
+\frac{365.25}{373.61}\times100\%\approx97.76\%.
+\]
+這不是整張 GPU 完全閒置的時間比例，也不是保證可達成的加速幅度。
+相較之下，等待 L1/TEX 操作結果的 Long Scoreboard 僅為 $3.41$。
+這些指標顯示主要壓力在記憶體指令的處理，而非單純等待 DRAM 回傳資料。
+上述指標定義可參考 NVIDIA 的
+\href{https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html}{Nsight Compute Profiling Guide}。
+
+\reportscreenshot{graph/warp.png}
+  {Warp State Statistics 與 LG Throttle 的實測分析。}
+  {fig:part1-warp}
+
+\textbf{達到多少 FP32 理論峰值？}
+以 $2048^3$ 的一般 benchmark 結果 $61.7\ \mathrm{GFLOP/s}$，
+以及 Part 0 的規格峰值 $8140.8\ \mathrm{GFLOP/s}$ 計算：
+\[
+\%P_{\mathrm{FP32}}
+ =\frac{61.7}{8140.8}\times100\%
+ \approx0.76\%.
+\]
+因此 harness 顯示一位小數時為 $0.8\%$。
+其餘兩個尺寸也只有約 $0.74\%$--$0.76\%$。
+這個比例是實際 FP32 GFLOP/s 除以規格峰值，
+與 ncu 的 Compute (SM) Throughput $6.03\%$ 不同；
+後者是硬體管線的吞吐指標，不能直接當成 FP32 峰值比例。
+
+\textbf{結論。}
+綜合低 FP32 效能、較高的整體記憶體處理吞吐、分散的 sector 存取，
+以及主導的 LG Throttle，naive 的主要限制指向\textbf{記憶體存取的處理效率}，
+而不是 FP32 math 吞吐已達上限。
+DRAM 頻寬並未飽和，因此不能將此結果簡化為「DRAM 搬運速度用滿」。
+分散的存取增加每個請求涉及的 sector 數，
+與記憶體指令佇列壓力及低 FP32 效能的觀察一致。
+
+這也不違反 Part 0：Part 0 的 compute-bound 判斷建立在 A、B 各從 DRAM
+讀取一次、C 寫回一次的理想假設，並未保證 naive 實作能有效利用硬體。
+效能比較採用 benchmark 時間；profiler 指標則解釋存取行為與等待原因，
+兩者的時間不混用。
+
+\clearpage
+\section*{Part 2: Coalesced Global Memory Access}
+
+\subsection*{Q1. Benchmark 結果}
+
+Coalesced 與 naive 皆由每個 thread 計算一個 C 元素，
+依序沿著 $k$ 累加 A 與 B 的乘積，最後計算
+$C=\alpha AB+\beta C$。Coalesced 的 thread mapping 為
+\texttt{threadIdx.x} 對應 col、\texttt{threadIdx.y} 對應 row，
+Block 為 $(32,32)$，grid 為
+$(\lceil N/32\rceil,\lceil M/32\rceil)$，邊界檢查維持
+\texttt{row < M \&\& col < N}，因此也能處理非整除與非方形矩陣。
+此版本不使用 shared memory，效能差異來自同一 warp 內的位址排列。
+
+在 $\alpha=1$、$\beta=0$ 下，三種尺寸的結果皆為 \texttt{PASS}，
+相對 naive 約加速 $5.59$--$10.15\times$。
+加速倍率為相同尺寸的 naive 時間除以 coalesced 時間。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}rrrrrcr@{}}
+\toprule
+$M=N=K$ & ms & GFLOP/s & \%cuBLAS & \%peakF & Check & 相對 naive \\
+\midrule
+1024 & 6.3365   & 338.9 & 13.1 & 4.2 & PASS & $5.59\times$ \\
+2048 & 27.4532  & 625.8 & 15.3 & 7.7 & PASS & $10.15\times$ \\
+4096 & 223.6519 & 614.5 & 14.6 & 7.5 & PASS & $9.98\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Coalesced 的一般 benchmark 結果；三種尺寸皆通過正確性檢查。}
+\label{tab:part2-benchmark}
+\end{table}
+
+\reportscreenshot{graph/part2_1024.png}
+  {$1024^3$ 的 coalesced benchmark 原始輸出。}
+  {fig:part2-benchmark-1024}
+\reportscreenshot{graph/part2_2048.png}
+  {$2048^3$ 的 coalesced benchmark 原始輸出。}
+  {fig:part2-benchmark-2048}
+\reportscreenshot{graph/part2_4096.png}
+  {$4096^3$ 的 coalesced benchmark 原始輸出。}
+  {fig:part2-benchmark-4096}
+
+\textbf{正確性與 sanitizer 檢查。}
+Coalesced 在 15 種尺寸、$\alpha=1.5$、$\beta\in\{0,0.5\}$
+的 30 組正確性測試皆為 \texttt{PASS}。
+5 組 memcheck 皆為 0 errors；3 組 racecheck 皆為 0 errors、0 warnings。
+
+\clearpage
+\subsection*{Q2. 相同運算量與讀取次數，為何速度改變？}
+
+\textbf{量測結果。}
+在 $2048^3$ 下，兩者的 global-load requests 數量相同，
+但 coalesced 的 sectors/request 明顯較低。
+這裡的 request 是 warp 記憶體指令送往 L1/TEX 的要求，
+不是一次 DRAM 傳輸。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+L1/TEX 指標 & Naive & Coalesced \\
+\midrule
+Global-load requests & $537{,}001{,}984$ & $537{,}001{,}984$ \\
+Global-load sectors & $8{,}862{,}535{,}049$ & $1{,}342{,}701{,}568$ \\
+Load sectors/request & $16.50$ & $2.50$ \\
+Global-store requests & $131{,}072$ & $131{,}072$ \\
+Global-store sectors & $4{,}194{,}304$ & $524{,}288$ \\
+Store sectors/request & $32.00$ & $4.00$ \\
+\bottomrule
+\end{tabular}
+\caption{相同尺寸下，coalescing 前後的 L1/TEX 存取統計。}
+\label{tab:part2-sectors}
+\end{table}
+
+Coalesced 的 global-load sectors/request 為
+\[
+\frac{1{,}342{,}701{,}568}{537{,}001{,}984}
+\approx2.50,
+\]
+相較 naive 的 $16.50$ 明顯降低。
+兩者 global-load requests 完全相同，但 coalesced 的 sector 存取總數
+減少約 $84.85\%$。這是 L1/TEX 的 sector 存取量改善，
+\emph{不能解讀成 DRAM 流量或執行時間也減少相同比例}。
+
+\textbf{由 thread mapping 解釋。}
+在主要迴圈固定的 $k$ 下，naive 的同一個 warp 負責不同 row、相同 col，
+讀 A 涉及 32 個 sector，讀 B 則只涉及 1 個 sector，
+因此兩次讀取平均為 $(32+1)/2=16.5$。
+
+Coalesced 改為同一個 warp 負責相同 row、連續的 32 個 col。
+此時 32 個 thread 的 \texttt{A[row*K+k]} 是同一個元素，只涉及 1 個 sector；
+\texttt{B[k*N+col]} 則為連續的 32 個 FP32 元素。
+一個 sector 為 32 bytes，可容納 8 個 FP32 元素，因此對本次對齊的
+$2048^3$ 存取，只需 4 個 sector 服務這次 B 讀取。
+主要迴圈的平均為
+\[
+\frac{1+4}{2}=2.5\ \text{sectors/request},
+\]
+與實測相符；完整統計還包含迴圈外對 C 的讀取，因此精確比值略高於 $2.5$。
+寫回 C 時，warp 內的位址也由跨列分散變為連續，
+所以 store sectors/request 從 $32$ 降為 $4$。
+
+每個 thread 仍執行相同次數的乘加，並以相同的 $k$ 順序讀取自己的 A、B 資料；
+改變的是\emph{同一時間、同一個 warp 內不同 thread 的位址關係}。
+更集中的存取降低記憶體請求的內部處理工作，
+不需要減少 FLOP 或讀取指令數，就能改善效能。
+
+\reportscreenshot{graph/part2_global.png}
+  {Coalesced 的 L1/TEX global load/store requests 與 sectors 原始計數。}
+  {fig:part2-global-access}
+
+\clearpage
+\subsection*{Q3. 哪個記憶體層級最忙？重複讀取由哪裡服務？}
+
+\textbf{記憶體階層的吞吐。}
+Coalesced 的 L1/TEX Cache Throughput 為
+$83.67\%$，高於 L2 的 $6.95\%$ 與 DRAM 的 $24.25\%$。
+以這些各自正規化的吞吐指標判斷，L1/TEX 最接近其處理上限，
+而不是 DRAM 頻寬已經飽和。
+這些百分比的計數方式與 active/elapsed 基準不完全相同，
+不能相加或當成資料來自各階層的分配比例。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+GPU Speed Of Light 指標 & Naive & Coalesced \\
+\midrule
+Duration & $278.23\ \mathrm{ms}$ & $20.49\ \mathrm{ms}$ \\
+Compute (SM) Throughput & $6.03\%$ & $83.66\%$ \\
+Memory Throughput & $49.77\%$ & $83.66\%$ \\
+L1/TEX Cache Throughput & $99.53\%$ & $83.67\%$ \\
+L2 Cache Throughput & $0.70\%$ & $6.95\%$ \\
+DRAM Throughput & $2.49\%$ & $24.25\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Coalescing 前後的 GPU Speed Of Light 指標。Duration 為 profiling 量測。}
+\label{tab:part2-sol}
+\end{table}
+
+\reportscreenshot{graph/part2_sol.png}
+  {Coalesced 的 GPU Speed Of Light Throughput 原始輸出。}
+  {fig:part2-sol}
+
+\textbf{重複讀取主要由 cache 服務。}
+雖然從 thread 的計算需求來看，每個 A 元素會被不同 col 的 thread
+讀取 $N$ 次，每個 B 元素會被不同 row 的 thread 讀取 $M$ 次，
+這並不代表每次讀取都要到 DRAM。
+Coalesced 的 L1/TEX sector 命中率為 $94.96\%$，
+顯示大量 sector 存取在 L1 就能命中；部分未命中的存取再由 L2 服務。
+因此，大量重複讀取主要由 L1 cache 吸收，而非一律重新從 DRAM 搬入。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Memory Workload Analysis 指標 & Naive & Coalesced \\
+\midrule
+Memory Throughput（DRAM 讀寫合計）& $8.00\ \mathrm{GB/s}$ & $83.15\ \mathrm{GB/s}$ \\
+L1/TEX Hit Rate & $99.04\%$ & $94.96\%$ \\
+L2 Hit Rate & $82.07\%$ & $49.62\%$ \\
+Mem Pipes Busy & $6.03\%$ & $83.66\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Coalescing 前後的實際 DRAM 吞吐、cache 命中率與記憶體指令吞吐指標。}
+\label{tab:part2-memory}
+\end{table}
+
+L1 與 L2 命中率各自以到達該層級的 sector 查詢為分母，不能直接相加。
+Coalesced 的命中率雖較低，執行仍更快，因為命中率只描述資料是否在 cache，
+並未描述每個 request 涉及多少 sector。
+Naive 即使有很高的命中率，仍需處理大量分散的 sector 存取。
+另外，此處 $83.15\ \mathrm{GB/s}$ 是 profiler 量到的實際 DRAM 讀寫吞吐，
+不同於 harness 用最低必要資料量除以時間得到的 \texttt{GB/s}。
+
+\reportscreenshot{graph/part2_memory.png}
+  {Coalesced 的 Memory Workload Analysis 原始輸出。}
+  {fig:part2-memory}
+
+\textbf{Compute (SM) 高，不等於 FP32 乘加已飽和。}
+Compute Workload Analysis 的
+\emph{Pipe Utilization (\% of peak instructions executed)} 表中，
+LSU 為 $83.44\%$，FMA 為 $12.46\%$。
+LSU 負責發出 load/store 等操作，FMA 管線則主要處理浮點算術，
+也可能執行部分整數運算。
+因此，Compute (SM) 的高吞吐不能直接當成 FP32 算力的使用比例；
+LSU 的高利用率與記憶體指令處理管線仍承受較大壓力的判斷一致。
+
+實際 FP32 效能仍以一般 benchmark 為準。以 $2048^3$ 為例：
+\[
+\frac{625.8}{8140.8}\times100\%\approx7.69\%,
+\]
+與 harness 的 $7.7\%$ 相符，而不是 $83.66\%$。
+
+\reportscreenshot{graph/part2_compute.png}
+  {Compute Workload Analysis 的管線利用率，包含 LSU 與 FMA 的實測值。}
+  {fig:part2-compute}
+
+\textbf{LG Throttle 明顯改善，但仍是主要等待原因。}
+LG Throttle 由 naive 的 $365.25$ 降至 coalesced 的 $20.38$。
+Warp State Statistics 的數值是每個 issued instruction 對應的平均 warp cycles，
+不是整張 GPU 完全閒置的時間。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+平均週期／issued instruction & Naive & Coalesced \\
+\midrule
+Warp Cycles Per Issued Instruction & $373.61$ & $27.25$ \\
+Stall LG Throttle & $365.25$ & $20.38$ \\
+Stall Long Scoreboard & $3.41$ & $1.27$ \\
+\bottomrule
+\end{tabular}
+\caption{Coalescing 前後的 warp 指令間隔與主要記憶體等待指標。}
+\label{tab:part2-stalls}
+\end{table}
+
+Coalesced 的 LG Throttle 約占平均指令間隔的
+\[
+\frac{20.38}{27.25}\times100\%\approx74.79\%.
+\]
+雖然仍是最大的等待原因，但其絕對值已從 $365.25$ 降為 $20.38$。
+這與 sector/request 降低、記憶體要求更容易處理的結果一致。
+LG Throttle 仍存在也合理：主要迴圈仍持續發出大量 global loads，
+Part 2 只改善存取集中程度，尚未透過 block 內明確共享來減少這些重複讀取。
+Profiler 的 Estimated Speedup 僅為潛在改善估計，
+不當成已測得或保證可達成的加速比例。
+
+\reportscreenshot[trim=75bp 165bp 188bp 182.5bp,clip]{graph/part2_warp.png}
+  {Coalesced 的 Warp State Statistics 節錄：平均 warp cycles 與主要等待指標。}
+  {fig:part2-warp}
+
+\textbf{結論。}
+Coalescing 在不改變主要 FLOP 與 global-load requests 數量的情況下，
+將平均 load sectors/request 從 $16.50$ 降至 $2.50$，
+並伴隨 LG Throttle 等待大幅減少。
+三種尺寸的一般 benchmark 相對 naive 約加速 $5.59$--$10.15\times$。
+重複讀取大量由 L1 cache 服務；剩餘壓力主要指向記憶體存取的處理，
+不能簡化為 FP32 算力或 DRAM 頻寬已經用滿。
+
+\clearpage
+\begingroup
+\setlength{\emergencystretch}{2em}
+\section*{Part 3: Shared Memory and Register Blocking}
+
+\subsection*{Q1. Benchmark 與六組參數實驗}
+
+在 $M=N=K=4096$、$\alpha=1$、$\beta=0$ 下，
+smem16、smem32 與六組 register-blocking 的結果皆為 \texttt{PASS}。
+六組參數以 R1--R6 表示，涵蓋不同的 block tile、K tile 與 thread tile 大小。
+Register blocking 的效能為 $2004.5$--$3157.4\ \mathrm{GFLOP/s}$，
+均高於每個 thread 只計算一個輸出的 smem16 與 smem32。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrrrc@{}}
+\toprule
+Kernel & ms & GFLOP/s & \%cuBLAS & \%peakF & Check \\
+\midrule
+smem16 & 207.5528 & 662.2  & 15.7 & 8.1  & PASS \\
+smem32 & 158.0202 & 869.8  & 20.7 & 10.7 & PASS \\
+R1     & 45.6292  & 3012.1 & 72.6 & 37.0 & PASS \\
+R2     & 68.5650  & 2004.5 & 48.3 & 24.6 & PASS \\
+R3     & 52.0103  & 2642.5 & 63.6 & 32.5 & PASS \\
+R4     & 47.8910  & 2869.8 & 69.1 & 35.3 & PASS \\
+R5     & 43.5296  & 3157.4 & 75.1 & 38.8 & PASS \\
+R6     & 50.1503  & 2740.5 & 65.3 & 33.7 & PASS \\
+\bottomrule
+\end{tabular}
+\caption{$4096^3$ 的 benchmark 結果。}
+\label{tab:part3-benchmark}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lccrrr@{}}
+\toprule
+設定 & $BM\times BN\times BK$ & $TM\times TN$ & Threads/block
+     & Regs/thread & Smem/block (B) \\
+\midrule
+R1 & $128\times128\times8$  & $8\times8$ & 256 & 119 & 8192 \\
+R2 & $64\times64\times8$    & $4\times4$ & 256 & 62  & 4096 \\
+R3 & $128\times64\times8$   & $8\times4$ & 256 & 76  & 6144 \\
+R4 & $128\times128\times16$ & $8\times8$ & 256 & 116 & 16384 \\
+R5 & $128\times128\times8$  & $8\times4$ & 512 & 64  & 8192 \\
+R6 & $64\times128\times8$   & $8\times8$ & 128 & 117 & 6144 \\
+\bottomrule
+\end{tabular}
+\caption{六組參數及編譯器資源使用量；六組皆無 register spill stores/loads。}
+\label{tab:part3-resources}
+\end{table}
+
+Registers/thread 為 ptxas 回報的每個 thread 的 register 配置量。
+Shared memory/block 則由 A、B 兩個 FP32 tile 的大小決定：
+\[
+S=4(BM\cdot BK+BK\cdot BN)=4BK(BM+BN)\ \text{bytes}.
+\]
+例如 R1 為 $4\times8\times(128+128)=8192$ bytes。
+\clearpage
+\textbf{Occupancy 與主要 warp stall。}
+理論 occupancy 為資源配置允許的 resident warps 占硬體上限的比例，
+實測 occupancy 則反映執行期間的平均 active warps。
+主要 stall 的數值為每個 issued instruction 對應的平均 warp cycles，
+不是百分比或 kernel 的總等待時間。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrlr@{}}
+\toprule
+設定 & 理論 occupancy & 實測 occupancy & 最大 stall & 平均週期 \\
+\midrule
+R1 & $50\%$  & $49.25\%$ & Short Scoreboard & 1.64 \\
+R2 & $100\%$ & $98.99\%$ & Long Scoreboard  & 7.45 \\
+R3 & $75\%$  & $73.87\%$ & Long Scoreboard  & 3.51 \\
+R4 & $50\%$  & $49.29\%$ & MIO Throttle     & 2.52 \\
+R5 & $100\%$ & $98.36\%$ & Long Scoreboard  & 4.33 \\
+R6 & $50\%$  & $49.00\%$ & Long Scoreboard  & 2.09 \\
+\bottomrule
+\end{tabular}
+\caption{六組 register-blocking 的 occupancy 與最大等待原因。}
+\label{tab:part3-occupancy}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+設定 & Shared-load 指令 & Shared-store 指令 & Load conflicts & Store conflicts \\
+\midrule
+R1 & $134{,}217{,}728$ & $33{,}554{,}432$ & $268{,}435{,}456$ & $117{,}440{,}512$ \\
+R2 & $268{,}435{,}456$ & $67{,}108{,}864$ & $0$             & $234{,}881{,}024$ \\
+R3 & $201{,}326{,}592$ & $50{,}331{,}648$ & $0$             & $234{,}881{,}024$ \\
+R4 & $134{,}217{,}728$ & $33{,}554{,}432$ & $268{,}435{,}456$ & $251{,}658{,}240$ \\
+R5 & $201{,}326{,}592$ & $33{,}554{,}432$ & $0$             & $117{,}440{,}512$ \\
+R6 & $134{,}217{,}728$ & $50{,}331{,}648$ & $268{,}435{,}456$ & $117{,}440{,}512$ \\
+\bottomrule
+\end{tabular}
+\caption{Shared Memory 表的 SASS 指令與 shared load/store bank-conflict 原始計數。}
+\label{tab:part3-shared}
+\end{table}
+
+這些是整個 kernel 的計數，不是每個 thread 的次數。
+Bank conflict 表示同一 shared-memory bank 的不同位址存取需要額外處理，
+不等於資料競爭或計算錯誤。讀取同一個位址可 broadcast，不能僅由
+「多個 thread 存取同一個 bank」判定一定有 conflict。
+寬指令本來也可能需要多個 wavefront，因此不直接把
+wavefronts/instruction 當成全部可消除的衝突倍率。
+
+\textbf{正確性。}
+完整正確性與 sanitizer 檢查結果為 \texttt{ALL PASSED}。
+\texttt{naive}、\texttt{coalesced}、\texttt{smem16}、\texttt{smem32}
+各在 15 種尺寸、兩種 $\beta$ 的 30 組測試皆為 \texttt{PASS}。
+R2 為 10 組 \texttt{PASS}、20 組 \texttt{SKIPPED}，其餘五組各為
+8 組 \texttt{PASS}、22 組 \texttt{SKIPPED}，皆符合 launcher 的尺寸限制。
+5 組 memcheck 與 3 組 racecheck 也皆為 clean。
+其中 \texttt{SKIPPED} 表示尺寸不符合 register-blocking 的整除條件，
+不代表該尺寸的計算結果已通過檢查。
+
+\reportscreenshot{graph/part3a_smem16_4096.png}
+  {$4096^3$ 的 smem16 benchmark。}
+  {fig:part3a-smem16}
+\reportscreenshot{graph/part3a_smem32_4096.png}
+  {$4096^3$ 的 smem32 benchmark。}
+  {fig:part3a-smem32}
+
+\clearpage
+\subsection*{Q2. 每次 FMA 需要多少 shared-memory loads？}
+
+只計算內層乘加迴圈在原始碼層級讀取的 FP32 元素數，
+不把 global-to-shared 載入、shared stores 或 C 的寫回混入此比值。
+Part 3a 每個 thread 計算一個輸出，每個 $k$ 讀取
+\texttt{As[ty][k]} 與 \texttt{Bs[k][tx]}，完成一次 FMA，因此
+\[
+L_{\mathrm{3a}}=\frac{1+1}{1}=2\ \text{shared loads/FMA}.
+\]
+
+Part 3b 每個 $k$ 先將 $TM$ 個 A 與 $TN$ 個 B 元素讀入 registers，
+再將這些值交叉組合，完成 $TM\times TN$ 次 FMA：
+\[
+L_{\mathrm{3b}}=\frac{TM+TN}{TM\cdot TN}.
+\]
+當 $TM=TN=8$，16 個 shared-memory 元素供 64 次 FMA 重複使用，故
+\[
+L_{\mathrm{3b},8\times8}=\frac{8+8}{8\times8}=0.25,
+\qquad
+\frac{L_{\mathrm{3a}}}{L_{\mathrm{3b},8\times8}}=8.
+\]
+也就是每次 FMA 的 shared-memory 元素讀取需求降為原本的八分之一。
+這是 \emph{register reuse}：A 值可供多個輸出 column 使用，
+B 值可供多個輸出 row 使用，不是省略矩陣乘法需要的乘加。
+
+以同為 $8\times8$ thread tile 的 R1 為例，一般 benchmark 的時間為
+$45.6292\ \mathrm{ms}$，相對 smem16 與 smem32 分別約快
+\[
+\frac{207.5528}{45.6292}\approx4.55\times,
+\qquad
+\frac{158.0202}{45.6292}\approx3.46\times.
+\]
+較少的 shared-memory 元素讀取需求有利於降低記憶體指令壓力，
+但不保證得到 $8\times$ 的執行加速；global 載入、同步、bank conflicts、
+register 用量與 occupancy 仍會影響時間。
+此外，編譯器可能合併成寬指令，所以此處的「元素 loads/FMA」
+不等於實際的 SASS 指令數/FMA。
+
+\subsection*{Q3. 最快與較慢設定的差異}
+
+\textbf{R5 與 R2：相近的高 occupancy，不同的指令工作量與等待。}
+R5 的量測時間最短，R2 最長，兩者的實測加速為
+\[
+\frac{68.5650}{43.5296}\approx1.58\times.
+\]
+兩者的理論 occupancy 都是 $100\%$，實測分別為 $98.36\%$ 與 $98.99\%$，
+因此不能將 R5 較快歸因於 occupancy 更高。
+R2 每個 thread 計算 $4\times4$，每次 FMA 需
+$(4+4)/16=0.5$ 個 shared-memory 元素 loads；
+R5 每個 thread 計算 $8\times4$，則為 $(8+4)/32=0.375$，減少 $25\%$。
+R5 的 $128\times128$ block tile 也比 R2 的 $64\times64$ 大，
+能在 block 內重用更多資料。
+
+實測 shared-load SASS 指令由 R2 的 $268{,}435{,}456$ 降至
+R5 的 $201{,}326{,}592$，shared-store 指令則由 $67{,}108{,}864$
+降至 $33{,}554{,}432$。兩者 load bank conflicts 都是 0；
+R5 的 store conflicts 雖減半，但 store 指令數也減半，
+不能將其解釋成每次 store 的衝突程度已改善。
+因此，即使 load 存取沒有 bank conflicts，整體指令工作量仍能造成效能差距。
+
+Warp 指標亦支持 R2 有更大的資料依賴與指令佇列壓力：
+Long Scoreboard 從 $7.45$ 降至 R5 的 $4.33$，
+MIO Throttle 從 $6.05$ 降至 $1.61$，Barrier 從 $2.44$ 降至 $1.53$。
+Long Scoreboard 是等待 L1/TEX 操作的結果，不代表一定等 DRAM；
+MIO Throttle 是相關指令佇列壓力，Barrier 則是等同 block 的其他 warps。
+這些平均 warp 週期不能直接相加換算成時間加速。
+R5 的 Short Scoreboard 反而較高（$3.55$ 對 $1.47$），
+顯示最快設定也不必在每一項 stall 上都最小。
+
+\textbf{其餘參數的取捨。}
+R1 的 $8\times8$ thread tile 有較佳的 register reuse，
+但每個 thread 使用 119 個 registers，register 限制每個 SM 只能放 2 個
+256-thread blocks，即 $2\times8=16$ 個 warps，理論 occupancy 為 $50\%$。
+R5 改為 $8\times4$ 後，每個 thread 使用 64 個 registers；
+每個 block 有 512 threads，仍可放 2 個 blocks，卻達到 32 個 resident warps。
+R5 的 load conflicts 也由 R1 的 $268{,}435{,}456$ 降為 0。
+這與 R5 較快的結果一致，但兩組同時改變多項執行特性，
+不能將全部差異歸給單一因素。
+
+R4 將 R1 的 $BK$ 由 8 增至 16，外層 tile 迭代數減半，
+Barrier 由 $0.80$ 降至 $0.61$；然而 shared memory/block 加倍，
+且 store bank conflicts 從 $117{,}440{,}512$ 增至 $251{,}658{,}240$，
+MIO Throttle 亦從 $1.44$ 增至 $2.52$，執行時間反而較長。
+R6 與 R1 同為 $8\times8$ thread tile，僅將 $BM$ 減半；
+兩者理論 occupancy 都是 $50\%$，load/store conflict 總數也相同，
+但 R6 的 shared-store 指令由 $33{,}554{,}432$ 增至 $50{,}331{,}648$，
+時間增至 $50.1503\ \mathrm{ms}$。
+這再次顯示 occupancy 或 conflict 總數本身不足以預測效能。
+
+綜合而言，較大的 register tile 可提高資料重用率，
+但也可能增加 register 用量、降低 occupancy 或改變 bank conflicts。
+最佳參數取決於這些因素的平衡，不能只以單一指標判斷。
+
+\clearpage
+\subsection*{六組 Benchmark 與 Profiler 截圖}
+
+R1--R6 的 benchmark、Occupancy、Warp State 與 Shared Memory 量測結果如下。
+
+% Display-only crops remove terminal margins; the source PNGs are unchanged.
+\newcommand{\regprofileimage}[2][]{%
+  \IfFileExists{#2}{%
+    \includegraphics[#1,width=\linewidth]{#2}%
+  }{%
+    \fbox{\parbox{0.92\linewidth}{\centering\small
+      圖片尚未載入\\\path{#2}}}%
+  }%
+}
+\newcommand{\regprofileevidence}[4]{%
+  \begin{figure}[H]
+    \centering
+    {\small\textbf{#1：}\texttt{\detokenize{#2}}}\par\smallskip
+    \regprofileimage{graph/part3b_#2_4096.png}\par\medskip
+    \begin{minipage}[t]{0.47\linewidth}
+      \vspace{0pt}\centering
+      {\small (a) Occupancy}\par\smallskip
+      \regprofileimage[#3]{graph/part3b_#2_occupancy_4096.png}
+    \end{minipage}\hfill
+    \begin{minipage}[t]{0.47\linewidth}
+      \vspace{0pt}\centering
+      {\small (b) Warp State}\par\smallskip
+      \regprofileimage[#4]{graph/part3b_#2_warp_4096.png}
+    \end{minipage}\par\medskip
+    {\small (c) Shared Memory}\par\smallskip
+    \regprofileimage{graph/part3b_#2_shared_4096.png}
+    \caption{#1 在 $4096^3$ 的 benchmark 與分析指標原始截圖。}
+    \label{fig:part3b-#1}
+  \end{figure}
+}
+
+\regprofileevidence{R1}{reg2d_128x128x8_8x8}
+  {trim=22.5bp 60.75bp 752.25bp 85.5bp,clip}
+  {trim=22.5bp 6bp 843.75bp 178.5bp,clip}
+\clearpage
+\regprofileevidence{R2}{reg2d_64x64x8_4x4}
+  {trim=15bp 23.25bp 599.25bp 46.5bp,clip}
+  {trim=0bp 0bp 0bp 0bp,clip}
+\clearpage
+\regprofileevidence{R3}{reg2d_128x64x8_8x4}
+  {trim=15bp 39.75bp 599.25bp 46.5bp,clip}
+  {trim=0bp 0bp 0bp 0bp,clip}
+\clearpage
+\regprofileevidence{R4}{reg2d_128x128x16_8x8}
+  {trim=15bp 50.25bp 609bp 46.5bp,clip}
+  {trim=0bp 0bp 0bp 0bp,clip}
+\clearpage
+\regprofileevidence{R5}{reg2d_128x128x8_8x4}
+  {trim=15bp 23.25bp 609bp 46.5bp,clip}
+  {trim=0bp 0bp 0bp 0bp,clip}
+\clearpage
+\regprofileevidence{R6}{reg2d_64x128x8_8x8}
+  {trim=15bp 42.75bp 603bp 46.5bp,clip}
+  {trim=0bp 0bp 0bp 0bp,clip}
+
+\clearpage
+\endgroup
+
+\begingroup
+\section*{Part 4: Further Optimization}
+
+兩項優化皆以 Part 3 的 R5（\texttt{reg2d\_128x128x8\_8x4}）為起點，
+維持 $BM=BN=128$、$BK=8$、$TM=8$、$TN=4$，每個 block 有 512 個 threads。
+\texttt{custom\_pad4} 只調整 A tile 的 shared-memory 排列；
+\texttt{custom\_pad4\_vec4} 保留此排列，再將 A、B 的 global loads 向量化。
+兩者均維持 FP32 乘加與 $C=\alpha AB+\beta C$ 的計算，不使用 tensor cores。
+以下效能比較皆為 $M=N=K=4096$、$\alpha=1$、$\beta=0$ 的最終評分量測。
+
+% Display-only crops retain the metric rows used in the analysis.
+\newcommand{\partfourimage}[2][]{%
+  \IfFileExists{#2}{%
+    \includegraphics[#1,width=\linewidth]{#2}%
+  }{%
+    \fbox{\parbox{0.92\linewidth}{\centering\small
+      圖片尚未載入\\\path{#2}}}%
+  }%
+}
+
+\subsection*{優化一：Shared-memory Padding}
+
+\textbf{設計變更。}
+A tile 的宣告由 \texttt{As[BK][BM]} 改為 \texttt{As[BK][BM+4]}，
+其餘載入迴圈、thread mapping、內層乘加與 C 寫回皆不變。
+每列仍只使用前 $BM$ 個元素；額外四個位置不參與計算，
+而是將相鄰列的儲存間距由 128 個 float 改為 132 個 float。
+
+\textbf{為何能減少 bank conflicts？}
+Shared memory 的連續 FP32 元素依序對應 32 個 banks。
+以 \texttt{As[0][0]} 位於 bank 0 為例，原本與 padding 後的 bank 編號分別為
+\[
+\begin{aligned}
+b_{\mathrm{original}}(k,m)&=(128k+m)\bmod32=m\bmod32,\\
+b_{\mathrm{pad4}}(k,m)&=(132k+m)\bmod32=(4k+m)\bmod32.
+\end{aligned}
+\]
+在 cooperative loading 的一次迭代中，同一 warp 的
+\texttt{idx} 為連續 32 個值，且 $m=\lfloor\texttt{idx}/8\rfloor$、
+$k=\texttt{idx}\bmod8$。
+因此原本每八個 threads 寫入同一 bank 的八個不同位置，
+整個 warp 僅分布在四個 banks；padding 後則分散至 32 個不同 banks。
+這改善的是轉置寫入 \texttt{As[k][m]} 的衝突，不是減少矩陣元素或 FLOP。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Profiler 指標 & R5 原版 & \texttt{custom\_pad4} \\
+\midrule
+Shared-load bank conflicts & $0$ & $0$ \\
+Shared-store bank conflicts & $117{,}440{,}512$ & $0$ \\
+\bottomrule
+\end{tabular}
+\caption{$4096^3$ 的 shared-memory bank-conflict 原始計數。}
+\end{table}
+
+\textbf{效能與代價。}
+時間由 $45.959\ \mathrm{ms}$ 降至 $42.117\ \mathrm{ms}$，
+相對原版加速 $1.091\times$。
+Shared-store bank conflicts 降為 0，與減少存取序列化的設計預期一致。
+Shared memory/block 由 8192 bytes 增至 8320 bytes，僅多
+$BK\times4\times4=128$ bytes；兩版均為 64 registers/thread，且無 register spills。
+因此本次改善不需改變 thread tile 或增加乘加運算，代價主要是少量額外儲存空間。
+
+\begin{figure}[H]
+\centering
+{\small\textbf{R5 原版：shared-memory bank conflicts}}\par\smallskip
+\partfourimage[trim=0bp 120bp 0bp 0bp,clip]
+  {graph/part3b_reg2d_128x128x8_8x4_shared_4096.png}\par\medskip
+{\small\textbf{\texttt{custom\_pad4}：shared-memory bank conflicts}}\par\smallskip
+\partfourimage[trim=0bp 120bp 0bp 0bp,clip]
+  {graph/part4_custom_pad4_shared_4096.png}
+\caption{Padding 前後的 shared-memory 指標節錄，包含 load 與 store bank conflicts。}
+\end{figure}
+
+\clearpage
+\subsection*{優化二：Vectorized Global Loads}
+
+\textbf{設計變更。}
+\texttt{custom\_pad4\_vec4} 保留 padding 與既有乘加迴圈，
+僅將 A、B tile 的 scalar global loads 改為 \texttt{float4} loads。
+原本每次處理一個 FP32 元素，現在每次讀取四個連續 FP32 元素，
+再以 \texttt{v.x}、\texttt{v.y}、\texttt{v.z}、\texttt{v.w}
+分別放入對應的 shared-memory 位置。
+A 仍以 \texttt{As[k][m]} 轉置儲存，B 仍以 \texttt{Bs[k][n]} 儲存。
+載入迴圈的工作單位改為四個元素，因此 A、B 的迴圈上限分別為
+$BM(BK/4)$ 與 $BK(BN/4)$，並相應調整索引。
+
+\textbf{為何能改善效能？}
+\texttt{float4} 將四個 float 組成 16-byte 的讀取單位，
+可用較少的 global-load 指令取得相同資料。
+本設定的 $BK=8$、$BN=128$ 及 launcher 的整除限制，配合對齊的矩陣起始位址，
+使向量化讀取符合 16-byte 對齊要求。
+乘加次數、thread 數量、C 的寫回與 FP32 精度皆維持不變。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Profiler 指標 & \texttt{custom\_pad4} & \texttt{custom\_pad4\_vec4} \\
+\midrule
+Global-load SASS 指令 & $34{,}078{,}720$ & $8{,}912{,}896$ \\
+Global-store SASS 指令 & $524{,}288$ & $524{,}288$ \\
+\bottomrule
+\end{tabular}
+\caption{向量化前後的動態指令計數，分別對應 global load/store 的 SASS 指標。}
+\end{table}
+
+Global-load 指令數減少約
+$\bigl(1-8{,}912{,}896/34{,}078{,}720\bigr)\times100\%=73.85\%$，
+而 global-store 指令數不變，與僅修改載入方式的設計相符。
+這些是整個 kernel 的指令計數，並非讀取的 float 數或 DRAM bytes；
+不能據此認為 DRAM 流量也減少 $73.85\%$，或時間應縮短四倍。
+時間由 $42.117\ \mathrm{ms}$ 降至 $36.235\ \mathrm{ms}$，
+相對 padding 版本加速 $1.162\times$。
+兩版均使用 64 registers/thread、8320 bytes shared memory/block，且無 register spills。
+
+\begin{figure}[H]
+\centering
+{\small\textbf{\texttt{custom\_pad4}：global-load/store 指令}}\par\smallskip
+\partfourimage[trim=0bp 1.5bp 363bp 36bp,clip]
+  {graph/part4_custom_pad4_global_4096.png}\par\medskip
+{\small\textbf{\texttt{custom\_pad4\_vec4}：global-load/store 指令}}\par\smallskip
+\partfourimage[trim=0bp 1.5bp 393bp 36bp,clip]
+  {graph/part4_custom_pad4_vec4_global_4096.png}
+\caption{向量化前後的 global-load/store SASS 指令原始計數節錄。}
+\end{figure}
+
+\subsection*{效能比較與正確性}
+
+最終評分量測對每個版本取三輪、每輪 20 次執行的中位數，再取三輪中的最佳值。
+加速倍率為前一版本的時間除以目前版本時間。
+兩步皆超過 $1.05\times$ 的門檻，各得 5 分，Part 4 合計為 $10/10$。
+下列時間與前述兩項優化的比較來自同一次評分結果，
+不混用其他 benchmark 或 profiler 的時間。
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrc@{}}
+\toprule
+Kernel & ms & 相對前一步 & 得分 \\
+\midrule
+\texttt{reg2d\_128x128x8\_8x4} & 45.959 & 基準 & -- \\
+\texttt{custom\_pad4} & 42.117 & $1.091\times$ & 5 \\
+\texttt{custom\_pad4\_vec4} & 36.235 & $1.162\times$ & 5 \\
+\bottomrule
+\end{tabular}
+\caption{$4096^3$ 的最終優化鏈與評分結果。}
+\end{table}
+
+兩項自訂 kernel 均在支援尺寸通過正確性、memcheck 與 racecheck 檢查。
+不符合 launcher 整除條件的尺寸為 \texttt{SKIPPED}，不當成已通過的計算結果。
+因此兩項改善均建立在正確性檢查通過的基礎上：
+padding 改善 shared-memory 寫入的 bank conflicts，
+向量化則降低 global-load 指令工作量。
+
+\reportscreenshot[trim=0bp 0bp 0bp 277.5bp,clip]{graph/part4_grade_vec4.png}
+  {最終評分結果節錄：兩項優化皆成功，Part 4 為 $10/10$。}
+  {fig:part4-grade}
+\endgroup
+\end{document}
